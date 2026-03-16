@@ -11,7 +11,7 @@ This is a **standalone npm package** that opencode loads dynamically via its ext
 
 ## Installation
 
-### Local development (recommended for testing)
+### Local development
 
 ```bash
 git clone <this-repo>
@@ -22,12 +22,6 @@ bun run build
 
 Then reference it via `file://` in your `opencode.json`.
 
-### From npm (once published)
-
-```bash
-# opencode installs it automatically when configured
-```
-
 ## Configuration
 
 Add this to your project's `opencode.json`:
@@ -36,7 +30,7 @@ Add this to your project's `opencode.json`:
 {
   "provider": {
     "claude-code": {
-      "npm": "file:///path/to/opencode-claude-code",
+      "npm": "opencode-claude-code-plugin@latest",
       "models": {
         "haiku": {
           "name": "Claude Code Haiku",
@@ -65,7 +59,7 @@ Add this to your project's `opencode.json`:
 }
 ```
 
-Replace `file:///path/to/opencode-claude-code` with the actual path on your machine, or use `"opencode-claude-code"` if published to npm.
+Replace `"opencode-claude-code-plugin"` with a `file://` path if you're using a local build.
 
 The model IDs (`haiku`, `sonnet`, `opus`) are passed directly to `claude --model`, which accepts these aliases natively.
 
