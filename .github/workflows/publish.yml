@@ -14,7 +14,9 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-      - run: npm install
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run build
       - name: Publish package
-        run: npx jsr publish --allow-dirty
+        run: npm publish --access public
