@@ -1,6 +1,6 @@
 {
   "name": "opencode-claude-code-plugin",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Claude Code CLI provider plugin for opencode",
   "type": "module",
   "main": "dist/index.js",
@@ -36,5 +36,9 @@
     "ai-sdk",
     "provider"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/unixfox/opencode-claude-code-plugin"
+  }
 }
