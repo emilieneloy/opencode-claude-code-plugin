@@ -7,6 +7,9 @@ import type {
   LanguageModelV2Usage,
 } from "@ai-sdk/provider"
 import { generateId } from "@ai-sdk/provider-utils"
+import { existsSync } from "node:fs"
+import { join } from "node:path"
+import { spawnSync } from "node:child_process"
 import type { ClaudeCodeConfig, ClaudeStreamMessage } from "./types.js"
 import { mapTool } from "./tool-mapping.js"
 import { getClaudeUserMessage } from "./message-builder.js"
@@ -38,12 +41,205 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
     return this.config.provider
   }
 
+  private resolveCwd(options?: { providerOptions?: Record<string, unknown> }): string {
+    // If user explicitly configured a cwd, respect it.
+    if (this.config.cwd && this.config.cwd.trim().length > 0) {
+      return this.config.cwd
+    }
+
+    // If OpenCode passed provider-level cwd explicitly, use it.
+    const providerOpts = options?.providerOptions as
+      | Record<string, Record<string, unknown>>
+      | undefined
+    const claudeCodeOpts = providerOpts?.["claude-code"]
+    const explicitCwd = claudeCodeOpts?.["cwd"]
+    if (typeof explicitCwd === "string" && explicitCwd.trim().length > 0) {
+      return explicitCwd
+    }
+
+    // Desktop app can run with process cwd="/". If a sessionID is present,
+    // resolve the actual OpenCode session directory from its SQLite DB.
+    const sessionID = claudeCodeOpts?.["sessionID"]
+    if (typeof sessionID === "string" && /^[A-Za-z0-9_-]+$/.test(sessionID)) {
+      try {
+        const home = process.env.HOME
+        if (home) {
+          const dbPath = join(home, ".local", "share", "opencode", "opencode.db")
+          if (existsSync(dbPath)) {
+            const sql = `select directory from session where id='${sessionID}' limit 1;`
+            const res = spawnSync("sqlite3", [dbPath, sql], {
+              encoding: "utf8",
+              timeout: 1500,
+            })
+            const dbCwd = (res.stdout ?? "").trim()
+            if (dbCwd.length > 0) return dbCwd
+          }
+        }
+      } catch {
+        // Fallback below.
+      }
+    }
+
+    // External providers on some OpenCode builds do not receive sessionID/cwd.
+    // In desktop mode process.cwd() may be "/" even when a project session is open.
+    // Use the most recently updated non-root session directory as a best-effort
+    // fallback when cwd is root.
+    const runtimeCwd = process.cwd()
+    if (runtimeCwd === "/") {
+      try {
+        const home = process.env.HOME
+        if (home) {
+          const dbPath = join(home, ".local", "share", "opencode", "opencode.db")
+          if (existsSync(dbPath)) {
+            const nowMs = Date.now()
+            const fiveMinAgo = nowMs - 5 * 60 * 1000
+            const sql =
+              "select directory from session " +
+              "where directory != '/' and time_updated >= " +
+              `${fiveMinAgo} ` +
+              "order by time_updated desc limit 1;"
+            const res = spawnSync("sqlite3", [dbPath, sql], {
+              encoding: "utf8",
+              timeout: 1500,
+            })
+            const recentDir = (res.stdout ?? "").trim()
+            if (recentDir.length > 0) return recentDir
+          }
+        }
+      } catch {
+        // Fall through to runtime cwd.
+      }
+    }
+
+    // Default: runtime cwd at call time.
+    return runtimeCwd
+  }
+
+  private requestScope(options: { tools?: unknown }): "tools" | "no-tools" {
+    return Array.isArray(options?.tools) ? "tools" : "no-tools"
+  }
+
+  private latestUserText(
+    prompt: Parameters<LanguageModelV2["doGenerate"]>[0]["prompt"],
+  ): string {
+    for (let i = prompt.length - 1; i >= 0; i--) {
+      const msg = prompt[i]
+      if (msg.role !== "user") continue
+
+      if (typeof msg.content === "string") {
+        return String(msg.content).trim()
+      }
+
+      if (Array.isArray(msg.content)) {
+        const text = (msg.content as any[])
+          .filter((part) => part.type === "text" && typeof part.text === "string")
+          .map((part: any) => String(part.text).trim())
+          .filter(Boolean)
+          .join(" ")
+        if (text) return text
+      }
+    }
+
+    return ""
+  }
+
+  private synthesizeTitle(
+    prompt: Parameters<LanguageModelV2["doGenerate"]>[0]["prompt"],
+  ): string {
+    const source = this.latestUserText(prompt)
+      .replace(/\s+/g, " ")
+      .replace(/[^\p{L}\p{N}\s-]/gu, " ")
+      .trim()
+
+    if (!source) return "New Session"
+
+    const stop = new Set([
+      "a",
+      "an",
+      "the",
+      "and",
+      "or",
+      "but",
+      "to",
+      "for",
+      "of",
+      "in",
+      "on",
+      "at",
+      "with",
+      "can",
+      "could",
+      "would",
+      "should",
+      "please",
+      "hi",
+      "hello",
+      "hey",
+      "there",
+      "you",
+      "your",
+      "this",
+      "that",
+      "is",
+      "are",
+      "was",
+      "were",
+      "be",
+      "do",
+      "does",
+      "did",
+      "summarize",
+      "summary",
+      "project",
+    ])
+
+    const words = source
+      .split(" ")
+      .map((word) => word.trim())
+      .filter(Boolean)
+      .filter((word) => !stop.has(word.toLowerCase()))
+
+    const picked = (words.length > 0 ? words : source.split(" ").filter(Boolean))
+      .slice(0, 6)
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(" ")
+
+    return picked || "New Session"
+  }
+
   async doGenerate(
     options: Parameters<LanguageModelV2["doGenerate"]>[0],
   ): Promise<Awaited<ReturnType<LanguageModelV2["doGenerate"]>>> {
     const warnings: LanguageModelV2CallWarning[] = []
-    const cwd = this.config.cwd ?? process.cwd()
-    const sk = sessionKey(cwd, this.modelId)
+    const cwd = this.resolveCwd(options as any)
+    const scope = this.requestScope(options as any)
+    const sk = sessionKey(cwd, `${this.modelId}::${scope}`)
+
+    if (scope === "no-tools") {
+      const text = this.synthesizeTitle(options.prompt)
+      return {
+        content: [{ type: "text", text }] as any,
+        finishReason: "stop",
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+        },
+        request: { body: { text: "" } },
+        response: {
+          id: generateId(),
+          timestamp: new Date(),
+          modelId: this.modelId,
+        },
+        providerMetadata: {
+          "claude-code": {
+            synthetic: true,
+            path: "no-tools",
+          },
+        },
+        warnings,
+      }
+    }
 
     const hasPriorConversation =
       options.prompt.filter((m) => m.role === "user" || m.role === "assistant")
@@ -303,10 +499,49 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
     options: Parameters<LanguageModelV2["doStream"]>[0],
   ): Promise<Awaited<ReturnType<LanguageModelV2["doStream"]>>> {
     const warnings: LanguageModelV2CallWarning[] = []
-    const cwd = this.config.cwd ?? process.cwd()
+    const cwd = this.resolveCwd(options as any)
     const cliPath = this.config.cliPath
     const skipPermissions = this.config.skipPermissions !== false
-    const sk = sessionKey(cwd, this.modelId)
+    const scope = this.requestScope(options as any)
+    const sk = sessionKey(cwd, `${this.modelId}::${scope}`)
+
+    if (scope === "no-tools") {
+      const text = this.synthesizeTitle(options.prompt)
+      const textId = generateId()
+      const stream = new ReadableStream<LanguageModelV2StreamPart>({
+        start(controller) {
+          controller.enqueue({ type: "stream-start", warnings })
+          controller.enqueue({ type: "text-start", id: textId } as any)
+          controller.enqueue({
+            type: "text-delta",
+            id: textId,
+            delta: text,
+          })
+          controller.enqueue({ type: "text-end", id: textId })
+          controller.enqueue({
+            type: "finish",
+            finishReason: "stop",
+            usage: {
+              inputTokens: 0,
+              outputTokens: 0,
+              totalTokens: 0,
+            },
+            providerMetadata: {
+              "claude-code": {
+                synthetic: true,
+                path: "no-tools",
+              },
+            },
+          })
+          controller.close()
+        },
+      })
+
+      return {
+        stream,
+        request: { body: { text: "" } },
+      }
+    }
 
     const hasPriorConversation =
       options.prompt.filter((m) => m.role === "user" || m.role === "assistant")
@@ -331,6 +566,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
       textLength: userMsg.length,
       includeHistoryContext,
       hasActiveProcess,
+      maxOutputTokens: (options as any)?.maxOutputTokens ?? null,
     })
 
     const cliArgs = buildCliArgs({
