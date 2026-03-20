@@ -7,6 +7,7 @@ import type {
   LanguageModelV2Usage,
 } from "@ai-sdk/provider"
 import { generateId } from "@ai-sdk/provider-utils"
+import { createHash } from "node:crypto"
 import { existsSync } from "node:fs"
 import { join } from "node:path"
 import { spawnSync } from "node:child_process"
@@ -115,6 +116,15 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
     return runtimeCwd
   }
 
+  private hashSystemPrompt(prompt: Parameters<LanguageModelV2["doGenerate"]>[0]["prompt"]): string {
+    const systemMsg = prompt.find(m => m.role === "system")
+    if (!systemMsg) return "no-system"
+    const content = typeof systemMsg.content === "string"
+      ? systemMsg.content
+      : JSON.stringify(systemMsg.content)
+    return createHash("sha256").update(content).digest("hex").slice(0, 12)
+  }
+
   private requestScope(options: { tools?: unknown }): "tools" | "no-tools" {
     return Array.isArray(options?.tools) ? "tools" : "no-tools"
   }
@@ -213,7 +223,8 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
     const warnings: LanguageModelV2CallWarning[] = []
     const cwd = this.resolveCwd(options as any)
     const scope = this.requestScope(options as any)
-    const sk = sessionKey(cwd, `${this.modelId}::${scope}`)
+    const agentHash = this.hashSystemPrompt(options.prompt)
+    const sk = sessionKey(cwd, `${this.modelId}::${scope}`, agentHash)
 
     if (scope === "no-tools") {
       const text = this.synthesizeTitle(options.prompt)
@@ -503,7 +514,8 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
     const cliPath = this.config.cliPath
     const skipPermissions = this.config.skipPermissions !== false
     const scope = this.requestScope(options as any)
-    const sk = sessionKey(cwd, `${this.modelId}::${scope}`)
+    const agentHash = this.hashSystemPrompt(options.prompt)
+    const sk = sessionKey(cwd, `${this.modelId}::${scope}`, agentHash)
 
     if (scope === "no-tools") {
       const text = this.synthesizeTitle(options.prompt)

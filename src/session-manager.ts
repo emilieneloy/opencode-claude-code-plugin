@@ -136,9 +136,10 @@ export function buildCliArgs(opts: {
 }
 
 /**
- * Build a session key that includes both cwd and model,
- * so different models get separate processes.
+ * Build a session key that includes cwd, model, and optionally an agent hash,
+ * so different agents sharing the same model get separate processes.
  */
-export function sessionKey(cwd: string, modelId: string): string {
-  return `${cwd}::${modelId}`
+export function sessionKey(cwd: string, modelId: string, agentHash?: string): string {
+  const base = `${cwd}::${modelId}`
+  return agentHash ? `${base}::${agentHash}` : base
 }
