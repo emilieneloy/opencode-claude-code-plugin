@@ -301,7 +301,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
       durationMs?: number
       usage?: ClaudeStreamMessage["usage"]
     } = {}
-    const toolCalls: Array<{ id: string; name: string; args: unknown }> = []
+    const toolCalls: Array<{ id: string; name: string; args: unknown; inputJson: string }> = []
 
     const result = await new Promise<
       typeof resultMeta & {
@@ -349,6 +349,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
                   id: block.id,
                   name: block.name,
                   args: block.input ?? {},
+                  inputJson: "",
                 })
               }
             }
@@ -364,6 +365,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
                 id: msg.content_block.id,
                 name: msg.content_block.name,
                 args: {},
+                inputJson: "",
               })
             }
           }
@@ -382,11 +384,18 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
             ) {
               const tc = toolCalls[msg.index]
               if (tc) {
-                try {
-                  tc.args = JSON.parse(msg.delta.partial_json)
-                } catch {
-                  // Partial JSON, accumulate
-                }
+                tc.inputJson += msg.delta.partial_json
+              }
+            }
+          }
+
+          if (msg.type === "content_block_stop" && msg.index !== undefined) {
+            const tc = toolCalls[msg.index]
+            if (tc && tc.inputJson) {
+              try {
+                tc.args = JSON.parse(tc.inputJson)
+              } catch {
+                // Failed to parse accumulated JSON
               }
             }
           }
@@ -424,6 +433,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
 
       proc.on("error", (err) => {
         log.error("process error", { error: err.message })
+        proc.kill()
         reject(err)
       })
 
@@ -432,6 +442,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
       })
 
       proc.stdin?.write(userMsg + "\n")
+      proc.stdin?.end()
     })
 
     const content: LanguageModelV2Content[] = []
