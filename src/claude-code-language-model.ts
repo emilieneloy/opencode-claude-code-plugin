@@ -310,6 +310,22 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
         toolCalls: typeof toolCalls
       }
     >((resolve, reject) => {
+      // Safety-net timeout: if CLI hangs without output, kill and reject
+      const TIMEOUT_MS = 300_000 // 5 minutes
+      const timeout = setTimeout(() => {
+        proc.kill()
+        reject(new Error(`claude CLI timed out after ${TIMEOUT_MS / 1000}s`))
+      }, TIMEOUT_MS)
+
+      const settleResolve = (value: typeof resultMeta & { text: string; thinking: string; toolCalls: typeof toolCalls }) => {
+        clearTimeout(timeout)
+        resolve(value)
+      }
+      const settleReject = (err: unknown) => {
+        clearTimeout(timeout)
+        reject(err)
+      }
+
       rl.on("line", (line) => {
         if (!line.trim()) return
         try {
@@ -395,7 +411,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
               try {
                 tc.args = JSON.parse(tc.inputJson)
               } catch {
-                // Failed to parse accumulated JSON
+                log.warn("failed to parse tool input JSON", { toolName: tc.name, inputJson: tc.inputJson })
               }
             }
           }
@@ -410,7 +426,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
               durationMs: msg.duration_ms,
               usage: msg.usage,
             }
-            resolve({
+            settleResolve({
               ...resultMeta,
               text: responseText,
               thinking: thinkingText,
@@ -423,7 +439,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
       })
 
       rl.on("close", () => {
-        resolve({
+        settleResolve({
           ...resultMeta,
           text: responseText,
           thinking: thinkingText,
@@ -434,7 +450,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
       proc.on("error", (err) => {
         log.error("process error", { error: err.message })
         proc.kill()
-        reject(err)
+        settleReject(err)
       })
 
       proc.stderr?.on("data", (data: Buffer) => {
@@ -789,7 +805,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
                 let parsedInput: any = {}
                 try {
                   parsedInput = JSON.parse(tc.inputJson || "{}")
-                } catch {}
+                } catch {
+                  log.warn("failed to parse tool input JSON", { toolName: tc.name, inputJson: tc.inputJson })
+                }
 
                 if (
                   tc.name === "AskUserQuestion" ||

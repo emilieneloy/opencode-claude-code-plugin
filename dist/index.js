@@ -559,6 +559,19 @@ var ClaudeCodeLanguageModel = class {
     let resultMeta = {};
     const toolCalls = [];
     const result = await new Promise((resolve, reject) => {
+      const TIMEOUT_MS = 3e5;
+      const timeout = setTimeout(() => {
+        proc.kill();
+        reject(new Error(`claude CLI timed out after ${TIMEOUT_MS / 1e3}s`));
+      }, TIMEOUT_MS);
+      const settleResolve = (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      };
+      const settleReject = (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      };
       rl.on("line", (line) => {
         if (!line.trim()) return;
         try {
@@ -626,6 +639,7 @@ _Asking: ${question}_
               try {
                 tc.args = JSON.parse(tc.inputJson);
               } catch {
+                log.warn("failed to parse tool input JSON", { toolName: tc.name, inputJson: tc.inputJson });
               }
             }
           }
@@ -639,7 +653,7 @@ _Asking: ${question}_
               durationMs: msg.duration_ms,
               usage: msg.usage
             };
-            resolve({
+            settleResolve({
               ...resultMeta,
               text: responseText,
               thinking: thinkingText,
@@ -650,7 +664,7 @@ _Asking: ${question}_
         }
       });
       rl.on("close", () => {
-        resolve({
+        settleResolve({
           ...resultMeta,
           text: responseText,
           thinking: thinkingText,
@@ -660,7 +674,7 @@ _Asking: ${question}_
       proc.on("error", (err) => {
         log.error("process error", { error: err.message });
         proc.kill();
-        reject(err);
+        settleReject(err);
       });
       proc.stderr?.on("data", (data) => {
         log.debug("stderr", { data: data.toString().slice(0, 200) });
@@ -935,6 +949,7 @@ _Asking: ${question}_
                 try {
                   parsedInput = JSON.parse(tc.inputJson || "{}");
                 } catch {
+                  log.warn("failed to parse tool input JSON", { toolName: tc.name, inputJson: tc.inputJson });
                 }
                 if (tc.name === "AskUserQuestion" || tc.name === "ask_user_question") {
                   let question = "Question?";
@@ -1265,6 +1280,12 @@ function createClaudeCode(settings = {}) {
     return createModel(modelId);
   };
   provider.languageModel = createModel;
+  provider.textEmbeddingModel = () => {
+    throw new Error("textEmbeddingModel is not supported by claude-code provider");
+  };
+  provider.imageModel = () => {
+    throw new Error("imageModel is not supported by claude-code provider");
+  };
   return provider;
 }
 export {

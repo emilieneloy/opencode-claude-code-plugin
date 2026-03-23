@@ -31,6 +31,12 @@ export function createClaudeCode(
   } as ClaudeCodeProvider
 
   provider.languageModel = createModel
+  provider.textEmbeddingModel = () => {
+    throw new Error("textEmbeddingModel is not supported by claude-code provider")
+  }
+  provider.imageModel = () => {
+    throw new Error("imageModel is not supported by claude-code provider")
+  }
 
   return provider
 }
