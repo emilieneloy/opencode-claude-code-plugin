@@ -45,5 +45,4 @@ export { ClaudeCodeLanguageModel } from "./claude-code-language-model.js"
 export type {
   ClaudeCodeConfig,
   ClaudeCodeProviderSettings,
-  ClaudeStreamMessage,
 } from "./types.js"

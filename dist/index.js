@@ -3,7 +3,8 @@ import { generateId } from "@ai-sdk/provider-utils";
 import { createHash } from "crypto";
 import { existsSync } from "fs";
 import { join } from "path";
-import { spawnSync } from "child_process";
+import { spawn as spawnChild } from "child_process";
+import { query } from "@anthropic-ai/claude-agent-sdk";
 
 // src/logger.ts
 var DEBUG = process.env.DEBUG?.includes("opencode-claude-code") ?? false;
@@ -268,21 +269,7 @@ Now continuing with the current message:
 }
 
 // src/session-manager.ts
-import { spawn } from "child_process";
-import { createInterface } from "readline";
-import { EventEmitter } from "events";
-var activeProcesses = /* @__PURE__ */ new Map();
 var claudeSessions = /* @__PURE__ */ new Map();
-function getActiveProcess(key) {
-  return activeProcesses.get(key);
-}
-function deleteActiveProcess(key) {
-  const ap = activeProcesses.get(key);
-  if (ap) {
-    ap.proc.kill();
-    activeProcesses.delete(key);
-  }
-}
 function getClaudeSessionId(key) {
   return claudeSessions.get(key);
 }
@@ -291,70 +278,6 @@ function setClaudeSessionId(key, sessionId) {
 }
 function deleteClaudeSessionId(key) {
   claudeSessions.delete(key);
-}
-function spawnClaudeProcess(cliPath, cliArgs, cwd, sessionKey2) {
-  log.info("spawning new claude process", { cliPath, cliArgs, cwd, sessionKey: sessionKey2 });
-  const proc = spawn(cliPath, cliArgs, {
-    cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, TERM: "xterm-256color" }
-  });
-  const lineEmitter = new EventEmitter();
-  const rl = createInterface({ input: proc.stdout });
-  rl.on("line", (line) => {
-    lineEmitter.emit("line", line);
-  });
-  rl.on("close", () => {
-    lineEmitter.emit("close");
-  });
-  const ap = { proc, lineEmitter };
-  activeProcesses.set(sessionKey2, ap);
-  proc.on("exit", (code, signal) => {
-    log.info("claude process exited", { code, signal, sessionKey: sessionKey2 });
-    activeProcesses.delete(sessionKey2);
-    if (code !== 0 && code !== null) {
-      log.info("process exited with error, clearing session", {
-        code,
-        sessionKey: sessionKey2
-      });
-      claudeSessions.delete(sessionKey2);
-    }
-  });
-  proc.stderr?.on("data", (data) => {
-    const stderr = data.toString();
-    log.debug("stderr", { data: stderr.slice(0, 200) });
-    if (stderr.includes("Session ID") && (stderr.includes("already in use") || stderr.includes("not found") || stderr.includes("invalid"))) {
-      log.warn("claude session ID error, clearing session", {
-        sessionKey: sessionKey2,
-        error: stderr.slice(0, 200)
-      });
-      claudeSessions.delete(sessionKey2);
-    }
-  });
-  return ap;
-}
-function buildCliArgs(opts) {
-  const { sessionKey: sessionKey2, skipPermissions, includeSessionId = true, model } = opts;
-  const args = [
-    "--output-format",
-    "stream-json",
-    "--input-format",
-    "stream-json",
-    "--verbose"
-  ];
-  if (model) {
-    args.push("--model", model);
-  }
-  if (includeSessionId) {
-    const sessionId = claudeSessions.get(sessionKey2);
-    if (sessionId && !activeProcesses.has(sessionKey2)) {
-      args.push("--session-id", sessionId);
-    }
-  }
-  if (skipPermissions) {
-    args.push("--dangerously-skip-permissions");
-  }
-  return args;
 }
 function sessionKey(cwd, modelId, agentHash) {
   const base = `${cwd}::${modelId}`;
@@ -374,7 +297,21 @@ var ClaudeCodeLanguageModel = class {
   get provider() {
     return this.config.provider;
   }
-  resolveCwd(options) {
+  async runSqlite(dbPath, sql) {
+    return new Promise((resolve) => {
+      const proc = spawnChild("sqlite3", [dbPath, sql], {
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1500
+      });
+      let stdout = "";
+      proc.stdout.on("data", (chunk) => {
+        stdout += chunk.toString();
+      });
+      proc.on("close", () => resolve(stdout.trim()));
+      proc.on("error", () => resolve(""));
+    });
+  }
+  async resolveCwd(options) {
     if (this.config.cwd && this.config.cwd.trim().length > 0) {
       return this.config.cwd;
     }
@@ -392,11 +329,7 @@ var ClaudeCodeLanguageModel = class {
           const dbPath = join(home, ".local", "share", "opencode", "opencode.db");
           if (existsSync(dbPath)) {
             const sql = `select directory from session where id='${sessionID}' limit 1;`;
-            const res = spawnSync("sqlite3", [dbPath, sql], {
-              encoding: "utf8",
-              timeout: 1500
-            });
-            const dbCwd = (res.stdout ?? "").trim();
+            const dbCwd = await this.runSqlite(dbPath, sql);
             if (dbCwd.length > 0) return dbCwd;
           }
         }
@@ -413,11 +346,7 @@ var ClaudeCodeLanguageModel = class {
             const nowMs = Date.now();
             const fiveMinAgo = nowMs - 5 * 60 * 1e3;
             const sql = `select directory from session where directory != '/' and time_updated >= ${fiveMinAgo} order by time_updated desc limit 1;`;
-            const res = spawnSync("sqlite3", [dbPath, sql], {
-              encoding: "utf8",
-              timeout: 1500
-            });
-            const recentDir = (res.stdout ?? "").trim();
+            const recentDir = await this.runSqlite(dbPath, sql);
             if (recentDir.length > 0) return recentDir;
           }
         }
@@ -495,9 +424,54 @@ var ClaudeCodeLanguageModel = class {
     const picked = (words.length > 0 ? words : source.split(" ").filter(Boolean)).slice(0, 6).map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
     return picked || "New Session";
   }
+  /**
+   * Build SDK Options common to both doGenerate and doStream.
+   */
+  buildSdkOptions(cwd, sk, opts) {
+    const sdkOpts = {
+      model: this.modelId,
+      cwd,
+      includePartialMessages: true,
+      persistSession: false
+    };
+    if (this.config.skipPermissions !== false) {
+      sdkOpts.permissionMode = "bypassPermissions";
+      sdkOpts.allowDangerouslySkipPermissions = true;
+    }
+    if (opts?.resume) {
+      const existingSessionId = getClaudeSessionId(sk);
+      if (existingSessionId) {
+        sdkOpts.resume = existingSessionId;
+      }
+    }
+    return sdkOpts;
+  }
+  /**
+   * Extract the user-facing prompt text from the AI SDK prompt for the Agent SDK.
+   */
+  buildPromptText(prompt, includeHistoryContext) {
+    const cliMsg = getClaudeUserMessage(prompt, includeHistoryContext);
+    try {
+      const parsed = JSON.parse(cliMsg);
+      const content = parsed?.message?.content;
+      if (Array.isArray(content)) {
+        const texts = [];
+        for (const part of content) {
+          if (part.type === "text" && part.text) {
+            texts.push(part.text);
+          } else if (part.type === "tool_result") {
+            texts.push(`[Tool result for ${part.tool_use_id}]: ${typeof part.content === "string" ? part.content : JSON.stringify(part.content)}`);
+          }
+        }
+        return texts.join("\n\n");
+      }
+    } catch {
+    }
+    return this.latestUserText(prompt);
+  }
   async doGenerate(options) {
     const warnings = [];
-    const cwd = this.resolveCwd(options);
+    const cwd = await this.resolveCwd(options);
     const scope = this.requestScope(options);
     const agentHash = this.hashSystemPrompt(options.prompt);
     const sk = sessionKey(cwd, `${this.modelId}::${scope}`, agentHash);
@@ -529,180 +503,67 @@ var ClaudeCodeLanguageModel = class {
     const hasPriorConversation = options.prompt.filter((m) => m.role === "user" || m.role === "assistant").length > 1;
     if (!hasPriorConversation) {
       deleteClaudeSessionId(sk);
-      deleteActiveProcess(sk);
     }
     const hasExistingSession = !!getClaudeSessionId(sk);
     const includeHistoryContext = !hasExistingSession && hasPriorConversation;
-    const userMsg = getClaudeUserMessage(options.prompt, includeHistoryContext);
-    const cliArgs = buildCliArgs({
-      sessionKey: sk,
-      skipPermissions: this.config.skipPermissions !== false,
-      includeSessionId: false,
-      model: this.modelId
-    });
+    const promptText = this.buildPromptText(options.prompt, includeHistoryContext);
+    const sdkOpts = this.buildSdkOptions(cwd, sk, { resume: false });
     log.info("doGenerate starting", {
       cwd,
       model: this.modelId,
-      textLength: userMsg.length,
+      textLength: promptText.length,
       includeHistoryContext
     });
-    const { spawn: spawn2 } = await import("child_process");
-    const { createInterface: createInterface2 } = await import("readline");
-    const proc = spawn2(this.config.cliPath, cliArgs, {
-      cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, TERM: "xterm-256color" }
-    });
-    const rl = createInterface2({ input: proc.stdout });
     let responseText = "";
     let thinkingText = "";
-    let resultMeta = {};
     const toolCalls = [];
-    const result = await new Promise((resolve, reject) => {
-      const TIMEOUT_MS = 3e5;
-      const timeout = setTimeout(() => {
-        proc.kill();
-        reject(new Error(`claude CLI timed out after ${TIMEOUT_MS / 1e3}s`));
+    let resultMeta = {};
+    const q = query({ prompt: promptText, options: sdkOpts });
+    const TIMEOUT_MS = 3e5;
+    let timeoutHandle;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        q.close();
+        reject(new Error(`claude Agent SDK timed out after ${TIMEOUT_MS / 1e3}s`));
       }, TIMEOUT_MS);
-      const settleResolve = (value) => {
-        clearTimeout(timeout);
-        resolve(value);
-      };
-      const settleReject = (err) => {
-        clearTimeout(timeout);
-        reject(err);
-      };
-      rl.on("line", (line) => {
-        if (!line.trim()) return;
-        try {
-          const msg = JSON.parse(line);
-          if (msg.type === "system" && msg.subtype === "init") {
-            if (msg.session_id) {
-              setClaudeSessionId(sk, msg.session_id);
-            }
-          }
-          if (msg.type === "assistant" && msg.message?.content) {
-            for (const block of msg.message.content) {
-              if (block.type === "text" && block.text) {
-                responseText += block.text;
-              }
-              if (block.type === "thinking" && block.thinking) {
-                thinkingText += block.thinking;
-              }
-              if (block.type === "tool_use" && block.id && block.name) {
-                if (block.name === "AskUserQuestion" || block.name === "ask_user_question") {
-                  const parsedInput = block.input ?? {};
-                  const question = parsedInput?.question || "Question?";
-                  responseText += `
-
-_Asking: ${question}_
-
-`;
-                  continue;
-                }
-                toolCalls.push({
-                  id: block.id,
-                  name: block.name,
-                  args: block.input ?? {},
-                  inputJson: ""
-                });
-              }
-            }
-          }
-          if (msg.type === "content_block_start" && msg.content_block) {
-            if (msg.content_block.type === "tool_use" && msg.content_block.id && msg.content_block.name) {
-              toolCalls.push({
-                id: msg.content_block.id,
-                name: msg.content_block.name,
-                args: {},
-                inputJson: ""
-              });
-            }
-          }
-          if (msg.type === "content_block_delta" && msg.delta) {
-            if (msg.delta.type === "text_delta" && msg.delta.text) {
-              responseText += msg.delta.text;
-            }
-            if (msg.delta.type === "thinking_delta" && msg.delta.thinking) {
-              thinkingText += msg.delta.thinking;
-            }
-            if (msg.delta.type === "input_json_delta" && msg.delta.partial_json && msg.index !== void 0) {
-              const tc = toolCalls[msg.index];
-              if (tc) {
-                tc.inputJson += msg.delta.partial_json;
-              }
-            }
-          }
-          if (msg.type === "content_block_stop" && msg.index !== void 0) {
-            const tc = toolCalls[msg.index];
-            if (tc && tc.inputJson) {
-              try {
-                tc.args = JSON.parse(tc.inputJson);
-              } catch {
-                log.warn("failed to parse tool input JSON", { toolName: tc.name, inputJson: tc.inputJson });
-              }
-            }
-          }
-          if (msg.type === "result") {
-            if (msg.session_id) {
-              setClaudeSessionId(sk, msg.session_id);
-            }
-            resultMeta = {
-              sessionId: msg.session_id,
-              costUsd: msg.total_cost_usd,
-              durationMs: msg.duration_ms,
-              usage: msg.usage
-            };
-            settleResolve({
-              ...resultMeta,
-              text: responseText,
-              thinking: thinkingText,
-              toolCalls
-            });
-          }
-        } catch {
-        }
-      });
-      rl.on("close", () => {
-        settleResolve({
-          ...resultMeta,
-          text: responseText,
-          thinking: thinkingText,
-          toolCalls
-        });
-      });
-      proc.on("error", (err) => {
-        log.error("process error", { error: err.message });
-        proc.kill();
-        settleReject(err);
-      });
-      proc.stderr?.on("data", (data) => {
-        log.debug("stderr", { data: data.toString().slice(0, 200) });
-      });
-      proc.stdin?.write(userMsg + "\n");
-      proc.stdin?.end();
     });
+    try {
+      await Promise.race([
+        (async () => {
+          for await (const msg of q) {
+            const processed = this.processGenerateMessage(msg, sk);
+            if (processed.text) responseText += processed.text;
+            if (processed.thinking) thinkingText += processed.thinking;
+            if (processed.toolCall) toolCalls.push(processed.toolCall);
+            if (processed.result) resultMeta = processed.result;
+          }
+        })(),
+        timeoutPromise
+      ]);
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
     const content = [];
-    if (result.thinking) {
+    if (thinkingText) {
       content.push({
         type: "reasoning",
-        text: result.thinking
+        text: thinkingText
       });
     }
-    if (result.text) {
+    if (responseText) {
       content.push({
         type: "text",
-        text: result.text,
+        text: responseText,
         providerMetadata: {
           "claude-code": {
-            sessionId: result.sessionId ?? null,
-            costUsd: result.costUsd ?? null,
-            durationMs: result.durationMs ?? null
+            sessionId: resultMeta.sessionId ?? null,
+            costUsd: resultMeta.costUsd ?? null,
+            durationMs: resultMeta.durationMs ?? null
           }
         }
       });
     }
-    for (const tc of result.toolCalls) {
+    for (const tc of toolCalls) {
       const {
         name: mappedName,
         input: mappedInput,
@@ -719,35 +580,84 @@ _Asking: ${question}_
       });
     }
     const usage = {
-      inputTokens: result.usage?.input_tokens,
-      outputTokens: result.usage?.output_tokens,
-      totalTokens: result.usage?.input_tokens && result.usage?.output_tokens ? result.usage.input_tokens + result.usage.output_tokens : void 0
+      inputTokens: resultMeta.usage?.input_tokens,
+      outputTokens: resultMeta.usage?.output_tokens,
+      totalTokens: resultMeta.usage?.input_tokens && resultMeta.usage?.output_tokens ? resultMeta.usage.input_tokens + resultMeta.usage.output_tokens : void 0
     };
     return {
       content,
-      finishReason: result.toolCalls.length > 0 ? "tool-calls" : "stop",
+      finishReason: toolCalls.length > 0 ? "tool-calls" : "stop",
       usage,
-      request: { body: { text: userMsg } },
+      request: { body: { text: promptText } },
       response: {
-        id: result.sessionId ?? generateId(),
+        id: resultMeta.sessionId ?? generateId(),
         timestamp: /* @__PURE__ */ new Date(),
         modelId: this.modelId
       },
       providerMetadata: {
         "claude-code": {
-          sessionId: result.sessionId ?? null,
-          costUsd: result.costUsd ?? null,
-          durationMs: result.durationMs ?? null
+          sessionId: resultMeta.sessionId ?? null,
+          costUsd: resultMeta.costUsd ?? null,
+          durationMs: resultMeta.durationMs ?? null
         }
       },
       warnings
     };
   }
+  /**
+   * Process a single SDK message for doGenerate, extracting text/thinking/tool data.
+   */
+  processGenerateMessage(msg, sk) {
+    const out = {};
+    if (msg.type === "assistant") {
+      const betaMsg = msg.message;
+      if (betaMsg?.content) {
+        for (const block of betaMsg.content) {
+          if (block.type === "text" && block.text) {
+            out.text = (out.text ?? "") + block.text;
+          }
+          if (block.type === "thinking" && block.thinking) {
+            out.thinking = (out.thinking ?? "") + block.thinking;
+          }
+          if (block.type === "tool_use" && block.id && block.name) {
+            if (block.name === "AskUserQuestion" || block.name === "ask_user_question") {
+              const parsedInput = block.input ?? {};
+              const question = parsedInput?.question || "Question?";
+              out.text = (out.text ?? "") + `
+
+_Asking: ${question}_
+
+`;
+            } else {
+              out.toolCall = {
+                id: block.id,
+                name: block.name,
+                args: block.input ?? {}
+              };
+            }
+          }
+        }
+      }
+    }
+    if (msg.type === "user") {
+    }
+    if (msg.type === "result") {
+      const resultMsg = msg;
+      if (resultMsg.session_id) {
+        setClaudeSessionId(sk, resultMsg.session_id);
+      }
+      out.result = {
+        sessionId: resultMsg.session_id,
+        costUsd: resultMsg.total_cost_usd,
+        durationMs: resultMsg.duration_ms,
+        usage: resultMsg.usage
+      };
+    }
+    return out;
+  }
   async doStream(options) {
     const warnings = [];
-    const cwd = this.resolveCwd(options);
-    const cliPath = this.config.cliPath;
-    const skipPermissions = this.config.skipPermissions !== false;
+    const cwd = await this.resolveCwd(options);
     const scope = this.requestScope(options);
     const agentHash = this.hashSystemPrompt(options.prompt);
     const sk = sessionKey(cwd, `${this.modelId}::${scope}`, agentHash);
@@ -790,275 +700,162 @@ _Asking: ${question}_
     const hasPriorConversation = options.prompt.filter((m) => m.role === "user" || m.role === "assistant").length > 1;
     if (!hasPriorConversation) {
       deleteClaudeSessionId(sk);
-      deleteActiveProcess(sk);
     }
     const hasExistingSession = !!getClaudeSessionId(sk);
-    const hasActiveProcess = !!getActiveProcess(sk);
-    const includeHistoryContext = !hasExistingSession && !hasActiveProcess && hasPriorConversation;
-    const userMsg = getClaudeUserMessage(options.prompt, includeHistoryContext);
+    const includeHistoryContext = !hasExistingSession && hasPriorConversation;
+    const promptText = this.buildPromptText(options.prompt, includeHistoryContext);
+    const sdkOpts = this.buildSdkOptions(cwd, sk, { resume: hasExistingSession });
     log.info("doStream starting", {
       cwd,
       model: this.modelId,
-      textLength: userMsg.length,
+      textLength: promptText.length,
       includeHistoryContext,
-      hasActiveProcess,
-      maxOutputTokens: options?.maxOutputTokens ?? null
+      hasExistingSession
     });
-    const cliArgs = buildCliArgs({
-      sessionKey: sk,
-      skipPermissions,
-      model: this.modelId
-    });
+    const q = query({ prompt: promptText, options: sdkOpts });
+    const self = this;
     const stream = new ReadableStream({
-      start(controller) {
-        let activeProcess = getActiveProcess(sk);
-        let proc;
-        let lineEmitter;
-        if (activeProcess) {
-          proc = activeProcess.proc;
-          lineEmitter = activeProcess.lineEmitter;
-          log.debug("reusing active process", { sk });
-        } else {
-          const ap = spawnClaudeProcess(cliPath, cliArgs, cwd, sk);
-          proc = ap.proc;
-          lineEmitter = ap.lineEmitter;
-        }
-        controller.enqueue({ type: "stream-start", warnings });
+      async start(controller) {
         const textId = generateId();
         let textStarted = false;
         const reasoningIds = /* @__PURE__ */ new Map();
         const reasoningStarted = /* @__PURE__ */ new Map();
-        let turnCompleted = false;
-        let controllerClosed = false;
         const toolCallMap = /* @__PURE__ */ new Map();
         const toolCallsById = /* @__PURE__ */ new Map();
+        let toolCallCount = 0;
         let resultMeta = {};
-        const lineHandler = (line) => {
-          if (!line.trim()) return;
-          if (controllerClosed) return;
-          try {
-            const msg = JSON.parse(line);
-            log.debug("stream message", {
-              type: msg.type,
-              subtype: msg.subtype
-            });
-            if (msg.type === "system" && msg.subtype === "init") {
-              if (msg.session_id) {
-                setClaudeSessionId(sk, msg.session_id);
-                log.info("session initialized", {
-                  claudeSessionId: msg.session_id
-                });
-              }
+        let controllerClosed = false;
+        const safeEnqueue = (part) => {
+          if (!controllerClosed) controller.enqueue(part);
+        };
+        const safeClose = () => {
+          if (!controllerClosed) {
+            controllerClosed = true;
+            try {
+              controller.close();
+            } catch {
             }
-            if (msg.type === "content_block_start" && msg.content_block && msg.index !== void 0) {
-              const block = msg.content_block;
-              const idx = msg.index;
-              if (block.type === "thinking") {
-                const reasoningId = generateId();
-                reasoningIds.set(idx, reasoningId);
-                controller.enqueue({
-                  type: "reasoning-start",
-                  id: reasoningId
-                });
-                reasoningStarted.set(idx, true);
-              }
-              if (block.type === "text") {
-                if (!textStarted) {
-                  controller.enqueue({
-                    type: "text-start",
-                    id: textId
-                  });
-                  textStarted = true;
+          }
+        };
+        if (options.abortSignal) {
+          options.abortSignal.addEventListener("abort", () => {
+            log.info("abort signal received, closing query", { cwd });
+            q.close();
+            safeClose();
+          });
+        }
+        safeEnqueue({ type: "stream-start", warnings });
+        try {
+          for await (const msg of q) {
+            if (controllerClosed) break;
+            if (msg.type === "stream_event") {
+              const event = msg.event;
+              if (!event) continue;
+              if (event.type === "content_block_start" && event.content_block) {
+                const block = event.content_block;
+                const idx = event.index ?? 0;
+                if (block.type === "thinking") {
+                  const reasoningId = generateId();
+                  reasoningIds.set(idx, reasoningId);
+                  safeEnqueue({ type: "reasoning-start", id: reasoningId });
+                  reasoningStarted.set(idx, true);
                 }
-              }
-              if (block.type === "tool_use" && block.id && block.name) {
-                toolCallMap.set(idx, {
-                  id: block.id,
-                  name: block.name,
-                  inputJson: ""
-                });
-                if (block.name !== "AskUserQuestion" && block.name !== "ask_user_question") {
-                  const { name: mappedName, skip } = mapTool(block.name);
-                  if (!skip) {
-                    controller.enqueue({
-                      type: "tool-input-start",
-                      id: block.id,
-                      toolName: mappedName
-                    });
-                    log.info("tool started", {
-                      name: block.name,
-                      mappedName,
-                      id: block.id
-                    });
-                  }
-                }
-              }
-            }
-            if (msg.type === "content_block_delta" && msg.delta && msg.index !== void 0) {
-              const delta = msg.delta;
-              const idx = msg.index;
-              if (delta.type === "thinking_delta" && delta.thinking) {
-                const reasoningId = reasoningIds.get(idx);
-                if (reasoningId) {
-                  controller.enqueue({
-                    type: "reasoning-delta",
-                    id: reasoningId,
-                    delta: delta.thinking
-                  });
-                }
-              }
-              if (delta.type === "text_delta" && delta.text) {
-                if (!textStarted) {
-                  controller.enqueue({
-                    type: "text-start",
-                    id: textId
-                  });
-                  textStarted = true;
-                }
-                controller.enqueue({
-                  type: "text-delta",
-                  id: textId,
-                  delta: delta.text
-                });
-              }
-              if (delta.type === "input_json_delta" && delta.partial_json) {
-                const tc = toolCallMap.get(idx);
-                if (tc) {
-                  tc.inputJson += delta.partial_json;
-                  controller.enqueue({
-                    type: "tool-input-delta",
-                    id: tc.id,
-                    delta: delta.partial_json
-                  });
-                }
-              }
-            }
-            if (msg.type === "content_block_stop" && msg.index !== void 0) {
-              const idx = msg.index;
-              const reasoningId = reasoningIds.get(idx);
-              if (reasoningId && reasoningStarted.get(idx)) {
-                controller.enqueue({
-                  type: "reasoning-end",
-                  id: reasoningId
-                });
-                reasoningStarted.delete(idx);
-              }
-              const tc = toolCallMap.get(idx);
-              if (tc) {
-                let parsedInput = {};
-                try {
-                  parsedInput = JSON.parse(tc.inputJson || "{}");
-                } catch {
-                  log.warn("failed to parse tool input JSON", { toolName: tc.name, inputJson: tc.inputJson });
-                }
-                if (tc.name === "AskUserQuestion" || tc.name === "ask_user_question") {
-                  let question = "Question?";
-                  if (parsedInput?.questions && Array.isArray(parsedInput.questions) && parsedInput.questions.length > 0) {
-                    question = parsedInput.questions[0].question || parsedInput.questions[0].text || "Question?";
-                  } else {
-                    question = parsedInput?.question || parsedInput?.text || "Question?";
-                  }
+                if (block.type === "text") {
                   if (!textStarted) {
-                    controller.enqueue({
-                      type: "text-start",
-                      id: textId
-                    });
+                    safeEnqueue({ type: "text-start", id: textId });
                     textStarted = true;
                   }
-                  controller.enqueue({
-                    type: "text-delta",
-                    id: textId,
-                    delta: `
-
-_Asking: ${question}_
-
-`
-                  });
-                } else {
-                  const {
-                    name: mappedName,
-                    input: mappedInput,
-                    executed,
-                    skip
-                  } = mapTool(tc.name, parsedInput);
-                  if (!skip) {
-                    toolCallsById.set(tc.id, {
-                      id: tc.id,
-                      name: tc.name,
-                      input: parsedInput
-                    });
-                    controller.enqueue({
-                      type: "tool-call",
-                      toolCallId: tc.id,
-                      toolName: mappedName,
-                      input: JSON.stringify(mappedInput),
-                      providerExecuted: executed
-                    });
-                  }
-                  log.info("tool call complete", {
-                    name: tc.name,
-                    mappedName,
-                    id: tc.id,
-                    executed
-                  });
-                }
-              }
-            }
-            if (msg.type === "assistant" && msg.message?.content) {
-              for (const block of msg.message.content) {
-                if (block.type === "text" && block.text) {
-                  if (!textStarted) {
-                    controller.enqueue({
-                      type: "text-start",
-                      id: textId
-                    });
-                    textStarted = true;
-                  }
-                  controller.enqueue({
-                    type: "text-delta",
-                    id: textId,
-                    delta: block.text
-                  });
-                }
-                if (block.type === "thinking" && block.thinking) {
-                  const thinkingId = generateId();
-                  controller.enqueue({
-                    type: "reasoning-start",
-                    id: thinkingId
-                  });
-                  controller.enqueue({
-                    type: "reasoning-delta",
-                    id: thinkingId,
-                    delta: block.thinking
-                  });
-                  controller.enqueue({
-                    type: "reasoning-end",
-                    id: thinkingId
-                  });
                 }
                 if (block.type === "tool_use" && block.id && block.name) {
-                  const parsedInput = block.input ?? {};
-                  toolCallsById.set(block.id, {
+                  toolCallMap.set(idx, {
                     id: block.id,
                     name: block.name,
-                    input: parsedInput
+                    inputJson: ""
                   });
-                  if (block.name === "AskUserQuestion" || block.name === "ask_user_question") {
+                  if (block.name !== "AskUserQuestion" && block.name !== "ask_user_question") {
+                    const { name: mappedName, skip } = mapTool(block.name);
+                    if (!skip) {
+                      safeEnqueue({
+                        type: "tool-input-start",
+                        id: block.id,
+                        toolName: mappedName
+                      });
+                      log.info("tool started", {
+                        name: block.name,
+                        mappedName,
+                        id: block.id
+                      });
+                    }
+                  }
+                }
+              }
+              if (event.type === "content_block_delta" && event.delta) {
+                const delta = event.delta;
+                const idx = event.index ?? 0;
+                if (delta.type === "thinking_delta" && delta.thinking) {
+                  const reasoningId = reasoningIds.get(idx);
+                  if (reasoningId) {
+                    safeEnqueue({
+                      type: "reasoning-delta",
+                      id: reasoningId,
+                      delta: delta.thinking
+                    });
+                  }
+                }
+                if (delta.type === "text_delta" && delta.text) {
+                  if (!textStarted) {
+                    safeEnqueue({ type: "text-start", id: textId });
+                    textStarted = true;
+                  }
+                  safeEnqueue({
+                    type: "text-delta",
+                    id: textId,
+                    delta: delta.text
+                  });
+                }
+                if (delta.type === "input_json_delta" && delta.partial_json) {
+                  const tc = toolCallMap.get(idx);
+                  if (tc) {
+                    tc.inputJson += delta.partial_json;
+                    safeEnqueue({
+                      type: "tool-input-delta",
+                      id: tc.id,
+                      delta: delta.partial_json
+                    });
+                  }
+                }
+              }
+              if (event.type === "content_block_stop") {
+                const idx = event.index ?? 0;
+                const reasoningId = reasoningIds.get(idx);
+                if (reasoningId && reasoningStarted.get(idx)) {
+                  safeEnqueue({ type: "reasoning-end", id: reasoningId });
+                  reasoningStarted.delete(idx);
+                }
+                const tc = toolCallMap.get(idx);
+                if (tc) {
+                  let parsedInput = {};
+                  let parseOk = true;
+                  try {
+                    parsedInput = JSON.parse(tc.inputJson || "{}");
+                  } catch {
+                    log.warn("failed to parse tool input JSON, skipping tool call", { toolName: tc.name, inputJson: tc.inputJson });
+                    parseOk = false;
+                  }
+                  if (!parseOk) {
+                    toolCallMap.delete(idx);
+                  } else if (tc.name === "AskUserQuestion" || tc.name === "ask_user_question") {
                     let question = "Question?";
                     if (parsedInput?.questions && Array.isArray(parsedInput.questions) && parsedInput.questions.length > 0) {
-                      const q = parsedInput.questions[0];
-                      question = q.question || q.text || "Question?";
+                      question = parsedInput.questions[0].question || parsedInput.questions[0].text || "Question?";
                     } else {
                       question = parsedInput?.question || parsedInput?.text || "Question?";
                     }
                     if (!textStarted) {
-                      controller.enqueue({
-                        type: "text-start",
-                        id: textId
-                      });
+                      safeEnqueue({ type: "text-start", id: textId });
                       textStarted = true;
                     }
-                    controller.enqueue({
+                    safeEnqueue({
                       type: "text-delta",
                       id: textId,
                       delta: `
@@ -1073,133 +870,206 @@ _Asking: ${question}_
                       input: mappedInput,
                       executed,
                       skip
-                    } = mapTool(block.name, parsedInput);
+                    } = mapTool(tc.name, parsedInput);
                     if (!skip) {
-                      controller.enqueue({
-                        type: "tool-input-start",
-                        id: block.id,
-                        toolName: mappedName
+                      toolCallsById.set(tc.id, {
+                        id: tc.id,
+                        name: tc.name,
+                        input: parsedInput
                       });
-                      controller.enqueue({
+                      toolCallCount++;
+                      safeEnqueue({
                         type: "tool-call",
-                        toolCallId: block.id,
+                        toolCallId: tc.id,
                         toolName: mappedName,
                         input: JSON.stringify(mappedInput),
                         providerExecuted: executed
                       });
                     }
-                    log.info("tool_use from assistant message", {
-                      name: block.name,
+                    log.info("tool call complete", {
+                      name: tc.name,
                       mappedName,
-                      id: block.id,
+                      id: tc.id,
                       executed
                     });
                   }
                 }
-                if (block.type === "tool_result") {
-                  log.debug("tool_result", {
-                    toolUseId: block.tool_use_id
-                  });
-                }
               }
+              continue;
             }
-            if (msg.type === "user" && msg.message?.content) {
-              for (const block of msg.message.content) {
-                if (block.type === "tool_result" && block.tool_use_id) {
-                  const toolCall = toolCallsById.get(block.tool_use_id);
-                  if (toolCall) {
-                    let resultText = "";
-                    if (typeof block.content === "string") {
-                      resultText = block.content;
-                    } else if (Array.isArray(block.content)) {
-                      resultText = block.content.filter(
-                        (c) => c.type === "text" && typeof c.text === "string"
-                      ).map((c) => c.text).join("\n");
+            if (msg.type === "assistant") {
+              const betaMsg = msg.message;
+              if (betaMsg?.content) {
+                for (const block of betaMsg.content) {
+                  if (block.type === "text" && block.text) {
+                    if (!textStarted) {
+                      safeEnqueue({ type: "text-start", id: textId });
+                      textStarted = true;
                     }
-                    controller.enqueue({
-                      type: "tool-result",
-                      toolCallId: block.tool_use_id,
-                      toolName: toolCall.name,
-                      result: {
-                        output: resultText,
-                        title: toolCall.name,
-                        metadata: {}
-                      },
-                      providerExecuted: true
+                    safeEnqueue({
+                      type: "text-delta",
+                      id: textId,
+                      delta: block.text
                     });
-                    log.info("tool result emitted", {
-                      toolUseId: block.tool_use_id,
-                      name: toolCall.name
+                  }
+                  if (block.type === "thinking" && block.thinking) {
+                    const thinkingId = generateId();
+                    safeEnqueue({ type: "reasoning-start", id: thinkingId });
+                    safeEnqueue({
+                      type: "reasoning-delta",
+                      id: thinkingId,
+                      delta: block.thinking
                     });
-                    toolCallsById.delete(block.tool_use_id);
+                    safeEnqueue({ type: "reasoning-end", id: thinkingId });
+                  }
+                  if (block.type === "tool_use" && block.id && block.name) {
+                    const parsedInput = block.input ?? {};
+                    toolCallsById.set(block.id, {
+                      id: block.id,
+                      name: block.name,
+                      input: parsedInput
+                    });
+                    if (block.name === "AskUserQuestion" || block.name === "ask_user_question") {
+                      let question = "Question?";
+                      if (parsedInput?.questions && Array.isArray(parsedInput.questions) && parsedInput.questions.length > 0) {
+                        const qObj = parsedInput.questions[0];
+                        question = qObj.question || qObj.text || "Question?";
+                      } else {
+                        question = parsedInput?.question || parsedInput?.text || "Question?";
+                      }
+                      if (!textStarted) {
+                        safeEnqueue({ type: "text-start", id: textId });
+                        textStarted = true;
+                      }
+                      safeEnqueue({
+                        type: "text-delta",
+                        id: textId,
+                        delta: `
+
+_Asking: ${question}_
+
+`
+                      });
+                    } else {
+                      const {
+                        name: mappedName,
+                        input: mappedInput,
+                        executed,
+                        skip
+                      } = mapTool(block.name, parsedInput);
+                      if (!skip) {
+                        toolCallCount++;
+                        safeEnqueue({
+                          type: "tool-input-start",
+                          id: block.id,
+                          toolName: mappedName
+                        });
+                        safeEnqueue({
+                          type: "tool-call",
+                          toolCallId: block.id,
+                          toolName: mappedName,
+                          input: JSON.stringify(mappedInput),
+                          providerExecuted: executed
+                        });
+                      }
+                    }
                   }
                 }
               }
+              continue;
+            }
+            if (msg.type === "user") {
+              const userMsg = msg.message;
+              const content = userMsg?.content;
+              if (Array.isArray(content)) {
+                for (const block of content) {
+                  if (block.type === "tool_result" && block.tool_use_id) {
+                    const toolCall = toolCallsById.get(block.tool_use_id);
+                    if (toolCall) {
+                      let resultText = "";
+                      if (typeof block.content === "string") {
+                        resultText = block.content;
+                      } else if (Array.isArray(block.content)) {
+                        resultText = block.content.filter(
+                          (c) => c.type === "text" && typeof c.text === "string"
+                        ).map((c) => c.text).join("\n");
+                      }
+                      safeEnqueue({
+                        type: "tool-result",
+                        toolCallId: block.tool_use_id,
+                        toolName: toolCall.name,
+                        result: {
+                          output: resultText,
+                          title: toolCall.name,
+                          metadata: {}
+                        },
+                        providerExecuted: true
+                      });
+                      log.info("tool result emitted", {
+                        toolUseId: block.tool_use_id,
+                        name: toolCall.name
+                      });
+                      toolCallsById.delete(block.tool_use_id);
+                    }
+                  }
+                }
+              }
+              continue;
             }
             if (msg.type === "result") {
-              if (msg.session_id) {
-                setClaudeSessionId(sk, msg.session_id);
+              const resultMsg = msg;
+              if (resultMsg.session_id) {
+                setClaudeSessionId(sk, resultMsg.session_id);
               }
               resultMeta = {
-                sessionId: msg.session_id,
-                costUsd: msg.total_cost_usd,
-                durationMs: msg.duration_ms,
-                usage: msg.usage
+                sessionId: resultMsg.session_id,
+                costUsd: resultMsg.total_cost_usd,
+                durationMs: resultMsg.duration_ms,
+                usage: resultMsg.usage
               };
               log.info("conversation result", {
-                sessionId: msg.session_id,
-                durationMs: msg.duration_ms,
-                numTurns: msg.num_turns,
-                isError: msg.is_error
+                sessionId: resultMsg.session_id,
+                durationMs: resultMsg.duration_ms,
+                numTurns: resultMsg.num_turns,
+                isError: resultMsg.is_error
               });
-              turnCompleted = true;
               if (textStarted) {
-                controller.enqueue({ type: "text-end", id: textId });
+                safeEnqueue({ type: "text-end", id: textId });
               }
               for (const [idx, reasoningId] of reasoningIds) {
                 if (reasoningStarted.get(idx)) {
-                  controller.enqueue({
-                    type: "reasoning-end",
-                    id: reasoningId
-                  });
+                  safeEnqueue({ type: "reasoning-end", id: reasoningId });
                 }
               }
-              controller.enqueue({
+              safeEnqueue({
                 type: "finish",
-                finishReason: toolCallMap.size > 0 ? "tool-calls" : "stop",
+                finishReason: toolCallCount > 0 ? "tool-calls" : "stop",
                 usage: {
-                  inputTokens: msg.usage?.input_tokens,
-                  outputTokens: msg.usage?.output_tokens,
-                  totalTokens: msg.usage?.input_tokens && msg.usage?.output_tokens ? msg.usage.input_tokens + msg.usage.output_tokens : void 0
+                  inputTokens: resultMsg.usage?.input_tokens,
+                  outputTokens: resultMsg.usage?.output_tokens,
+                  totalTokens: resultMsg.usage?.input_tokens && resultMsg.usage?.output_tokens ? resultMsg.usage.input_tokens + resultMsg.usage.output_tokens : void 0
                 },
                 providerMetadata: {
                   "claude-code": resultMeta
                 }
               });
-              controllerClosed = true;
-              lineEmitter.off("line", lineHandler);
-              lineEmitter.off("close", closeHandler);
-              try {
-                controller.close();
-              } catch {
-              }
+              safeClose();
+              continue;
             }
-          } catch (e) {
-            log.debug("failed to parse line", {
-              error: e instanceof Error ? e.message : String(e)
-            });
+            log.debug("unhandled SDK message type", { type: msg.type });
           }
-        };
-        const closeHandler = () => {
-          log.debug("readline closed");
-          if (controllerClosed) return;
-          controllerClosed = true;
-          lineEmitter.off("line", lineHandler);
-          lineEmitter.off("close", closeHandler);
+        } catch (err) {
+          log.error("stream error", { error: err instanceof Error ? err.message : String(err) });
+          if (!controllerClosed) {
+            safeEnqueue({ type: "error", error: err instanceof Error ? err : new Error(String(err)) });
+            safeClose();
+          }
+        }
+        if (!controllerClosed) {
           if (textStarted) {
-            controller.enqueue({ type: "text-end", id: textId });
+            safeEnqueue({ type: "text-end", id: textId });
           }
-          controller.enqueue({
+          safeEnqueue({
             type: "finish",
             finishReason: "stop",
             usage: {
@@ -1211,51 +1081,16 @@ _Asking: ${question}_
               "claude-code": resultMeta
             }
           });
-          try {
-            controller.close();
-          } catch {
-          }
-        };
-        lineEmitter.on("line", lineHandler);
-        lineEmitter.on("close", closeHandler);
-        proc.on("error", (err) => {
-          log.error("process error", { error: err.message });
-          if (controllerClosed) return;
-          controllerClosed = true;
-          controller.enqueue({ type: "error", error: err });
-          try {
-            controller.close();
-          } catch {
-          }
-        });
-        if (options.abortSignal) {
-          options.abortSignal.addEventListener("abort", () => {
-            if (!turnCompleted) {
-              log.info(
-                "abort signal received mid-turn, keeping process alive",
-                { cwd }
-              );
-            }
-            if (!controllerClosed) {
-              controllerClosed = true;
-              lineEmitter.off("line", lineHandler);
-              lineEmitter.off("close", closeHandler);
-              try {
-                controller.close();
-              } catch {
-              }
-            }
-          });
+          safeClose();
         }
-        proc.stdin?.write(userMsg + "\n");
-        log.debug("sent user message", { textLength: userMsg.length });
       },
       cancel() {
+        q.close();
       }
     });
     return {
       stream,
-      request: { body: { text: userMsg } },
+      request: { body: { text: promptText } },
       response: { headers: {} }
     };
   }

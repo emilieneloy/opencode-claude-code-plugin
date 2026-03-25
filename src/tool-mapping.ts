@@ -101,7 +101,7 @@ export function mapTool(
   if (name === "EnterPlanMode") return { name: "plan_enter", input: {}, executed: false }
   if (name === "ExitPlanMode") return { name: "plan_exit", input: {}, executed: false }
 
-  // WebSearch
+  // WebSearch — assumes OpenCode MCP server name. Falls through to generic handler if renamed.
   if (name === "WebSearch" || name === "web_search") {
     const mappedInput = input?.query ? { query: input.query } : input
     log.debug("mapping WebSearch", { originalInput: input, mappedInput })
