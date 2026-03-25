@@ -23,6 +23,9 @@ export function createClaudeCode(
       // OpenCode project directory instead of provider init-time process cwd.
       cwd: settings.cwd,
       skipPermissions: settings.skipPermissions ?? true,
+      effort: settings.effort,
+      thinking: settings.thinking,
+      maxTurns: settings.maxTurns,
     })
   }
 

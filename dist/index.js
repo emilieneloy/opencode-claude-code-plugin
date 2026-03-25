@@ -438,6 +438,15 @@ var ClaudeCodeLanguageModel = class {
       sdkOpts.permissionMode = "bypassPermissions";
       sdkOpts.allowDangerouslySkipPermissions = true;
     }
+    if (this.config.effort) {
+      sdkOpts.effort = this.config.effort;
+    }
+    if (this.config.thinking) {
+      sdkOpts.thinking = this.config.thinking;
+    }
+    if (this.config.maxTurns) {
+      sdkOpts.maxTurns = this.config.maxTurns;
+    }
     if (opts?.resume) {
       const existingSessionId = getClaudeSessionId(sk);
       if (existingSessionId) {
@@ -1108,7 +1117,10 @@ function createClaudeCode(settings = {}) {
       // The model resolves cwd lazily per request so it tracks the active
       // OpenCode project directory instead of provider init-time process cwd.
       cwd: settings.cwd,
-      skipPermissions: settings.skipPermissions ?? true
+      skipPermissions: settings.skipPermissions ?? true,
+      effort: settings.effort,
+      thinking: settings.thinking,
+      maxTurns: settings.maxTurns
     });
   };
   const provider = function(modelId) {

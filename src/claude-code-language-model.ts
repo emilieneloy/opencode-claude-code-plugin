@@ -193,6 +193,18 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
       sdkOpts.allowDangerouslySkipPermissions = true
     }
 
+    if (this.config.effort) {
+      sdkOpts.effort = this.config.effort
+    }
+
+    if (this.config.thinking) {
+      sdkOpts.thinking = this.config.thinking
+    }
+
+    if (this.config.maxTurns) {
+      sdkOpts.maxTurns = this.config.maxTurns
+    }
+
     // Resume from existing session if available
     if (opts?.resume) {
       const existingSessionId = getClaudeSessionId(sk)
