@@ -543,7 +543,7 @@ var ClaudeCodeLanguageModel = class {
             const processed = this.processGenerateMessage(msg, sk);
             if (processed.text) responseText += processed.text;
             if (processed.thinking) thinkingText += processed.thinking;
-            if (processed.toolCall) toolCalls.push(processed.toolCall);
+            if (processed.toolCalls) toolCalls.push(...processed.toolCalls);
             if (processed.result) resultMeta = processed.result;
           }
         })(),
@@ -638,11 +638,12 @@ _Asking: ${question}_
 
 `;
             } else {
-              out.toolCall = {
+              if (!out.toolCalls) out.toolCalls = [];
+              out.toolCalls.push({
                 id: block.id,
                 name: block.name,
                 args: block.input ?? {}
-              };
+              });
             }
           }
         }

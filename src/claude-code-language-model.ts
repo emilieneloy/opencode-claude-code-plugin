@@ -333,7 +333,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
             const processed = this.processGenerateMessage(msg, sk)
             if (processed.text) responseText += processed.text
             if (processed.thinking) thinkingText += processed.thinking
-            if (processed.toolCall) toolCalls.push(processed.toolCall)
+            if (processed.toolCalls) toolCalls.push(...processed.toolCalls)
             if (processed.result) resultMeta = processed.result
           }
         })(),
@@ -424,7 +424,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
   ): {
     text?: string
     thinking?: string
-    toolCall?: { id: string; name: string; args: unknown }
+    toolCalls?: Array<{ id: string; name: string; args: unknown }>
     result?: { sessionId?: string; costUsd?: number; durationMs?: number; usage?: { input_tokens?: number; output_tokens?: number } }
   } {
     const out: ReturnType<typeof this.processGenerateMessage> = {}
@@ -448,11 +448,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV2 {
               const question = (parsedInput?.question as string) || "Question?"
               out.text = (out.text ?? "") + `\n\n_Asking: ${question}_\n\n`
             } else {
-              out.toolCall = {
+              if (!out.toolCalls) out.toolCalls = []
+              out.toolCalls.push({
                 id: block.id,
                 name: block.name,
                 args: block.input ?? {},
-              }
+              })
             }
           }
         }
